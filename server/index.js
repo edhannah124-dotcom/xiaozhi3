@@ -1,0 +1,48 @@
+const express = require("express");
+const path = require("path");
+const cors = require("cors");
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// 示例 API：转发到 OpenAI
+app.post("/api/ask", async (req, res) => {
+  try {
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) return res.status(500).json({ error: "Missing OPENAI_API_KEY" });
+
+    const messages = req.body?.messages || [{ role: "user", content: "Hello" }];
+
+    const r = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        messages
+      })
+    });
+
+    const data = await r.json();
+    res.json(data);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// 托管前端打包文件
+const distPath = path.join(__dirname, "../client/dist");
+app.use(express.static(distPath));
+app.get("*", (req, res) => {
+  res.sendFile(path.join(distPath, "index.html"));
+});
+
+// 启动
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Server running at http://0.0.0.0:${PORT}`);
+});
