@@ -40,6 +40,7 @@ app.use(express.static(distPath));
 app.get("*", (req, res) => {
   res.sendFile(path.join(distPath, "index.html"));
 });
+app.get("/__ping", (req, res) => res.send("pong"));
 
 // 启动
 const PORT = process.env.PORT || 3000;
