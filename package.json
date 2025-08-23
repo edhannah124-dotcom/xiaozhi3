@@ -3,7 +3,7 @@
   "private": true,
   "engines": { "node": ">=18" },
   "scripts": {
-    "postinstall": "npm ci --prefix client",
+    "postinstall": "npm install --prefix client",
     "build": "npm run build --prefix client",
     "start": "node server/index.js"
   },
