@@ -1,20 +1,3 @@
-const fs = require("fs");
-
-// 看 dist 目录里有什么
-app.get("/__ls", (req, res) => {
-  try {
-    const files = fs.readdirSync(distPath);
-    res.json({ distPath, files });
-  } catch (e) {
-    res.json({ distPath, error: String(e) });
-  }
-});
-
-// 明确看看 index.html 是否存在
-app.get("/__hasindex", (req, res) => {
-  const file = path.join(distPath, "index.html");
-  res.json({ file, exists: fs.existsSync(file) });
-});
 // server/index.js
 const express = require("express");
 const path = require("path");
@@ -56,7 +39,23 @@ app.post("/api/ask", async (req, res) => {
 // 托管前端（必须是 client/dist）
 const distPath = path.join(__dirname, "../client/dist");
 console.log("[distPath]", distPath, "exists:", fs.existsSync(distPath));
+const fs = require("fs");
 
+// 看 dist 目录里有什么
+app.get("/__ls", (req, res) => {
+  try {
+    const files = fs.readdirSync(distPath);
+    res.json({ distPath, files });
+  } catch (e) {
+    res.json({ distPath, error: String(e) });
+  }
+});
+
+// 明确看看 index.html 是否存在
+app.get("/__hasindex", (req, res) => {
+  const file = path.join(distPath, "index.html");
+  res.json({ file, exists: fs.existsSync(file) });
+});
 app.use(express.static(distPath));
 
 // 明确处理首页
