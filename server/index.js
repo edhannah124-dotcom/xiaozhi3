@@ -25,7 +25,7 @@ app.post("/api/ask", async (req, res) => {
         "Content-Type": "application/json",
         "Authorization": `Bearer ${apiKey}`
       },
-      body: JSON.stringify({ model: "gpt-4o-mini", messages })
+      body: JSON.stringify({ model: "gpt-4o", messages })
     });
 
     const data = await r.json();
