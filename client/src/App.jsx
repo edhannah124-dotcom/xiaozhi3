@@ -47,7 +47,7 @@ export default function App() {
 
   return (
     <div style={{ maxWidth: 720, margin: "40px auto", padding: 16, fontFamily: "system-ui" }}>
-      <h2 style={{ marginBottom: 12 }}>小智 · 全栈课堂助教</h2>
+      <h2 style={{ marginBottom: 12 }}>小智 · 编程课堂助教</h2>
 
       <div style={{ border: "1px solid #eee", borderRadius: 8, padding: 12, minHeight: 240 }}>
         {messages.map((m, i) => (
