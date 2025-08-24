@@ -1,3 +1,20 @@
+const fs = require("fs");
+
+// 看 dist 目录里有什么
+app.get("/__ls", (req, res) => {
+  try {
+    const files = fs.readdirSync(distPath);
+    res.json({ distPath, files });
+  } catch (e) {
+    res.json({ distPath, error: String(e) });
+  }
+});
+
+// 明确看看 index.html 是否存在
+app.get("/__hasindex", (req, res) => {
+  const file = path.join(distPath, "index.html");
+  res.json({ file, exists: fs.existsSync(file) });
+});
 // server/index.js
 const express = require("express");
 const path = require("path");
