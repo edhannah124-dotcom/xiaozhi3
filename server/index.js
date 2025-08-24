@@ -8,10 +8,10 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// 健康检查（确认 Node 的确在跑）
+// 健康检查
 app.get("/__ping", (req, res) => res.send("pong"));
 
-// 示例 API
+// 示例 API：转发到 OpenAI
 app.post("/api/ask", async (req, res) => {
   try {
     const apiKey = process.env.OPENAI_API_KEY;
@@ -36,12 +36,11 @@ app.post("/api/ask", async (req, res) => {
   }
 });
 
-// 托管前端（必须是 client/dist）
+// 静态托管：client/dist
 const distPath = path.join(__dirname, "../client/dist");
 console.log("[distPath]", distPath, "exists:", fs.existsSync(distPath));
-const fs = require("fs");
 
-// 看 dist 目录里有什么
+// ——探针：看 dist 里有哪些文件
 app.get("/__ls", (req, res) => {
   try {
     const files = fs.readdirSync(distPath);
@@ -51,24 +50,17 @@ app.get("/__ls", (req, res) => {
   }
 });
 
-// 明确看看 index.html 是否存在
+// ——探针：确认 index.html 是否存在
 app.get("/__hasindex", (req, res) => {
   const file = path.join(distPath, "index.html");
   res.json({ file, exists: fs.existsSync(file) });
 });
+
 app.use(express.static(distPath));
 
-// 明确处理首页
-app.get("/", (req, res) => {
-  const file = path.join(distPath, "index.html");
-  console.log("[serve index.html]", file, "exists:", fs.existsSync(file));
-  res.sendFile(file);
-});
-
-// 其余前端路由
-app.get("*", (req, res) => {
-  res.sendFile(path.join(distPath, "index.html"));
-});
+// 首页与其余前端路由都回 index.html
+app.get("/", (req, res) => res.sendFile(path.join(distPath, "index.html")));
+app.get("*", (req, res) => res.sendFile(path.join(distPath, "index.html")));
 
 // 启动
 const PORT = process.env.PORT || 3000;
