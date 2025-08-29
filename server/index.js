@@ -1,83 +1,156 @@
-// server/index.js
-const express = require("express");
-const path = require("path");
-const cors = require("cors");
-const fs = require("fs");
+import express from "express";
+import cors from "cors";
+import OpenAI from "openai";
 
+// ==== 基础配置 ====
+const PORT = process.env.PORT || 3000;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;  // 在 Render 环境变量里填
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "dev-admin"; // 简单保护导出接口
+const MODEL = process.env.MODEL || "gpt-4o";
+const MEMORY_WINDOW = parseInt(process.env.MEMORY_WINDOW || "12", 10); // 最近8–12轮
+const GLOBAL_CONCURRENCY = parseInt(process.env.GLOBAL_CONCURRENCY || "45", 10); // 全局并发上限
+
+if (!OPENAI_API_KEY) {
+  console.error("Missing OPENAI_API_KEY");
+  process.exit(1);
+}
+
+const client = new OpenAI({ apiKey: OPENAI_API_KEY });
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 
-// ——【这里是你的中文 System Prompt】——
-const SYSTEM_PROMPT = `
-你叫“小智”，是小学三年级 Scratch 编程课堂的助手。你的语气温和活泼，回答简短易懂，始终专注课堂内容。
+// ==== 简易内存存储（实验够用；重启会丢）====
+const memories = new Map(); // sessionId -> [{role, content, ts}]
+const logs = [];            // 结构化日志，便于导出
 
-【行为要求】
-1) 始终专注于小学三年级 Scratch 编程题目和课堂内容，避免偏离主题。不提供与课堂无关的信息或建议。
-2) 用温和活泼的语气与学生交流，激发学习兴趣。
-3) 回答要简短明了，适合三年级学生的理解水平；避免复杂术语和长句。
-4) 尽量用简单比喻或生活例子帮助理解编程概念。
-5) 内容不要冗长，突出重点，确保学生能快速明白。
-6) 若问题涉及具体操作步骤，请用简洁清晰的关键步骤描述。
-7) 对学生保持耐心和鼓励，多给积极反馈；在可能情况下，鼓励动手实践。
-`;
+function getSessionHistory(sessionId) {
+  const arr = memories.get(sessionId) || [];
+  // 只取最近 N 轮
+  return arr.slice(-MEMORY_WINDOW);
+}
+function appendSessionMessage(sessionId, msg) {
+  const arr = memories.get(sessionId) || [];
+  arr.push({ ...msg, ts: Date.now() });
+  memories.set(sessionId, arr);
+}
+function logEvent(e) {
+  logs.push({ ts: new Date().toISOString(), ...e });
+}
 
-// 健康检查
-app.get("/__ping", (req, res) => res.send("pong"));
+// ==== 全局并发信号量 ====
+class Semaphore {
+  constructor(max) { this.max = max; this.cur = 0; this.q = []; }
+  async acquire() {
+    if (this.cur < this.max) { this.cur++; return; }
+    await new Promise(res => this.q.push(res));
+    this.cur++;
+  }
+  release() {
+    this.cur--;
+    if (this.q.length) this.q.shift()();
+  }
+}
+const sem = new Semaphore(GLOBAL_CONCURRENCY);
 
-// 示例 API：转发到 OpenAI
-app.post("/api/ask", async (req, res) => {
+// ==== 每会话串行锁（避免同一会话并发写历史）====
+const sessionLocks = new Map(); // sessionId -> lastPromise
+async function runInSessionLock(sessionId, fn) {
+  const last = sessionLocks.get(sessionId) || Promise.resolve();
+  const next = last.then(fn).catch((e) => { throw e; });
+  sessionLocks.set(sessionId, next.finally(() => {
+    if (sessionLocks.get(sessionId) === next) sessionLocks.delete(sessionId);
+  }));
+  return next;
+}
+
+// ==== 健康检查，避免 Render 判定超时 ====
+app.get("/healthz", (_req, res) => res.status(200).send("OK"));
+
+// ==== 核心聊天接口 ====
+app.post("/chat", async (req, res) => {
+  const { sessionId, userMessage } = req.body || {};
+  if (!sessionId || !userMessage) {
+    return res.status(400).json({ error: "sessionId and userMessage are required" });
+  }
+
   try {
-    const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) return res.status(500).json({ error: "Missing OPENAI_API_KEY" });
-
-    const messages = req.body?.messages || [{ role: "user", content: "Hello" }];
-
-    const r = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${apiKey}`
-      },
-      body: JSON.stringify({ model: "gpt-4o", messages })
+    await runInSessionLock(sessionId, async () => {
+      // 记录用户消息
+      appendSessionMessage(sessionId, { role: "user", content: String(userMessage) });
     });
 
-    const data = await r.json();
-    res.json(data);
+    await sem.acquire();
+    let answerText = "";
+    let usage = null;
+    try {
+      const history = getSessionHistory(sessionId);
+
+      // 组装提示：系统规则 + 最近N轮 + 当前消息（已在历史中）
+      const systemRule = {
+        role: "system",
+        content:
+          "你是小学生Scratch编程课堂小助手，小智。回答短、小学生能懂，聚焦题目本身，不跑题；必要时给关键步骤。",
+      };
+      const messages = [systemRule, ...history];
+
+      // 调用 OpenAI（控制长度与风格）
+      const resp = await client.chat.completions.create({
+        model: MODEL,
+        messages,
+        // 回答风格与长度控制：
+        temperature: 0.3,    // 更稳定
+        top_p: 0.9,
+        max_tokens: 200,     // 控制输出长度
+        presence_penalty: 0, // 保守输出
+        frequency_penalty: 0.2,
+      });
+      const choice = resp.choices?.[0];
+      answerText = choice?.message?.content?.trim() || "";
+      usage = resp.usage;
+    } finally {
+      sem.release();
+    }
+
+    // 记录与落盘内存
+    await runInSessionLock(sessionId, async () => {
+      appendSessionMessage(sessionId, { role: "assistant", content: answerText });
+      logEvent({
+        type: "chat",
+        sessionId,
+        user: userMessage,
+        assistant: answerText,
+        usage
+      });
+    });
+
+    res.json({ answer: answerText });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: String(err) });
+    logEvent({ type: "error", sessionId, error: String(err?.message || err) });
+    res.status(500).json({ error: "Server error" });
   }
 });
 
-// 静态托管：client/dist
-const distPath = path.join(__dirname, "../client/dist");
-console.log("[distPath]", distPath, "exists:", fs.existsSync(distPath));
-
-// ——探针：看 dist 里有哪些文件
-app.get("/__ls", (req, res) => {
-  try {
-    const files = fs.readdirSync(distPath);
-    res.json({ distPath, files });
-  } catch (e) {
-    res.json({ distPath, error: String(e) });
+// ==== 管理：导出日志（JSONL）====
+app.get("/admin/export-logs", (req, res) => {
+  if (req.headers["x-admin-token"] !== ADMIN_TOKEN) {
+    return res.status(401).send("Unauthorized");
   }
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  // 导出为 JSONL（每行一个事件）
+  const body = logs.map(obj => JSON.stringify(obj)).join("\n");
+  res.send(body);
 });
 
-// ——探针：确认 index.html 是否存在
-app.get("/__hasindex", (req, res) => {
-  const file = path.join(distPath, "index.html");
-  res.json({ file, exists: fs.existsSync(file) });
+// ==== 管理：查看活跃会话 ====
+app.get("/admin/sessions", (req, res) => {
+  if (req.headers["x-admin-token"] !== ADMIN_TOKEN) {
+    return res.status(401).send("Unauthorized");
+  }
+  const list = Array.from(memories.keys());
+  res.json({ count: list.length, sessions: list });
 });
 
-app.use(express.static(distPath));
+app.listen(PORT, () => console.log(`Server running on ${PORT}`));
 
-// 首页与其余前端路由都回 index.html
-app.get("/", (req, res) => res.sendFile(path.join(distPath, "index.html")));
-app.get("*", (req, res) => res.sendFile(path.join(distPath, "index.html")));
-
-// 启动
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server running at http://0.0.0.0:${PORT}`);
-});
