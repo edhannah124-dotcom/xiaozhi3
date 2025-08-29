@@ -8,7 +8,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;  // 在 Render 环境变量�
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "dev-admin"; // 简单保护导出接口
 const MODEL = process.env.MODEL || "gpt-4o";
 const MEMORY_WINDOW = parseInt(process.env.MEMORY_WINDOW || "12", 10); // 最近8–12轮
-const GLOBAL_CONCURRENCY = parseInt(process.env.GLOBAL_CONCURRENCY || "5", 10); // 全局并发上限
+const GLOBAL_CONCURRENCY = parseInt(process.env.GLOBAL_CONCURRENCY || "45", 10); // 全局并发上限
 
 if (!OPENAI_API_KEY) {
   console.error("Missing OPENAI_API_KEY");
