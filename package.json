@@ -1,8 +1,15 @@
 {
-  "private": true,
-  "engines": { "node": ">=18" },
+  "name": "xiaozhi-backend",
+  "type": "module",
   "scripts": {
-    "build": "npm --prefix client run build",
-    "start": "node server/index.js"
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "openai": "^4.56.0"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
