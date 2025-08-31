@@ -12,7 +12,8 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;  // 在 Render 环境变量�
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "dev-admin"; // 简单保护导出接口
 const MODEL = process.env.MODEL || "gpt-4o";
 const MEMORY_WINDOW = parseInt(process.env.MEMORY_WINDOW || "12", 10); // 最近8–12轮
-const GLOBAL_CONCURRENCY = parseInt(process.env.GLOBAL_CONCURRENCY || "45", 10); // 全局并发上限
+const GLOBAL_CONCURRENCY = parseInt(process.env.GLOBAL_CONCURRENCY || 10", 10); // 全局并发上限
+const MAX_QUEUE = parseInt(process.env.MAX_QUEUE || "100", 10); // 允许排队的最大请求数
 
 if (!OPENAI_API_KEY) {
   console.error("Missing OPENAI_API_KEY");
@@ -65,6 +66,11 @@ class Semaphore {
   constructor(max) { this.max = max; this.cur = 0; this.q = []; }
   async acquire() {
     if (this.cur < this.max) { this.cur++; return; }
+    if (this.q.length >= MAX_QUEUE) {
+      const err = new Error("queue_full");
+      err.code = "QUEUE_FULL";
+      throw err;
+    }
     await new Promise(res => this.q.push(res));
     this.cur++;
   }
@@ -73,7 +79,7 @@ class Semaphore {
     if (this.q.length) this.q.shift()();
   }
 }
-const sem = new Semaphore(GLOBAL_CONCURRENCY);
+
 
 // ==== 每会话串行锁（避免同一会话并发写历史）====
 const sessionLocks = new Map(); // sessionId -> lastPromise
@@ -88,6 +94,26 @@ async function runInSessionLock(sessionId, fn) {
 
 // ==== 健康检查，避免 Render 判定超时 ====
 app.get("/healthz", (_req, res) => res.status(200).send("OK"));
+function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
+
+async function callOpenAIWithRetry(payload, retries = 3) {
+  let delay = 400; // 初始退避
+  for (let i = 0; i <= retries; i++) {
+    try {
+      return await client.chat.completions.create(payload);
+    } catch (e) {
+      const status = e?.status || e?.response?.status;
+      // 限速/服务端错误 → 退避重试；其它错误直接抛出
+      if ((status === 429 || (status >= 500 && status < 600)) && i < retries) {
+        await sleep(delay + Math.floor(Math.random() * 200));
+        delay *= 2;
+        continue;
+      }
+      throw e;
+    }
+  }
+}
+
 
 // ==== 核心聊天接口 ====
 app.post("/chat", async (req, res) => {
@@ -117,16 +143,16 @@ app.post("/chat", async (req, res) => {
       const messages = [systemRule, ...history];
 
       // 调用 OpenAI（控制长度与风格）
-      const resp = await client.chat.completions.create({
-        model: MODEL,
-        messages,
-        // 回答风格与长度控制：
-        temperature: 0.3,    // 更稳定
-        top_p: 0.9,
-        max_tokens: 200,     // 控制输出长度
-        presence_penalty: 0, // 保守输出
-        frequency_penalty: 0.2,
-      });
+   const resp = await callOpenAIWithRetry({
+  model: MODEL,
+  messages,
+  temperature: 0.3,
+  top_p: 0.9,
+  max_tokens: 200,
+  presence_penalty: 0,
+  frequency_penalty: 0.2,
+});
+
       const choice = resp.choices?.[0];
       answerText = choice?.message?.content?.trim() || "";
       usage = resp.usage;
