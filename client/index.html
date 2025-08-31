@@ -1,12 +1,96 @@
 <!doctype html>
-<html lang="zh-cn">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>小智 · 编程课堂助教</title>
-  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.jsx"></script>
-  </body>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>小智 · Scratch 助手</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 20px; }
+    .row { margin: 8px 0; }
+    label { display: block; margin-bottom: 4px; font-weight: 600; }
+    input, textarea, button { width: 100%; padding: 10px; font-size: 16px; }
+    textarea { height: 120px; }
+    #log { margin-top: 16px; padding: 12px; background: #f6f7f9; border-radius: 8px; min-height: 80px; white-space: pre-wrap; }
+    .msg-u { color:#333; }
+    .msg-a { color:#0a7; }
+    .hint { color:#666; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <h2>小智 · Scratch 助手</h2>
+
+  <div class="row">
+    <label for="sid">学生编号（sessionId）</label>
+    <input id="sid" placeholder="如：class3-A-07" />
+    <div class="hint">只需填一次，浏览器会记住；务必保持每次提问都用同一个编号。</div>
+  </div>
+
+  <div class="row">
+    <label for="question">你的问题</label>
+    <textarea id="question" placeholder="例如：角色怎么循环移动？"></textarea>
+  </div>
+
+  <div class="row">
+    <button id="send">发送</button>
+  </div>
+
+  <div id="log"></div>
+
+  <script>
+    // 读取/保存本地的 sessionId
+    const sidInput = document.getElementById('sid');
+    const saved = localStorage.getItem('sid');
+    if (saved) sidInput.value = saved;
+    sidInput.addEventListener('change', () => {
+      localStorage.setItem('sid', sidInput.value.trim());
+    });
+
+    const btn = document.getElementById('send');
+    const q  = document.getElementById('question');
+    const log = document.getElementById('log');
+
+    function append(type, text){
+      const div = document.createElement('div');
+      div.className = type === 'u' ? 'msg-u' : 'msg-a';
+      div.textContent = (type === 'u' ? '你：' : '小智：') + text;
+      log.appendChild(div);
+      log.scrollTop = log.scrollHeight;
+    }
+
+    btn.addEventListener('click', async () => {
+      const sid = sidInput.value.trim();
+      const msg = q.value.trim();
+      if (!sid) { alert('请先填写学生编号'); return; }
+      if (!msg)  { alert('请输入问题'); return; }
+
+      localStorage.setItem('sid', sid);
+      append('u', msg);
+
+      btn.disabled = true;
+      btn.textContent = '发送中…';
+
+      try {
+        const resp = await fetch('/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sessionId: sid, userMessage: msg })
+        });
+
+        if (!resp.ok) {
+          const err = await resp.json().catch(()=>({error: resp.statusText}));
+          append('a', `出错：${err.error || resp.statusText}`);
+        } else {
+          const data = await resp.json();
+          append('a', data.answer || '(空回复)');
+        }
+      } catch(e) {
+        append('a', '网络异常，请稍后再试');
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '发送';
+        q.value = '';
+      }
+    });
+  </script>
+</body>
 </html>
