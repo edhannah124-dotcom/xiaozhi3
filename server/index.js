@@ -9,11 +9,11 @@ import OpenAI from "openai";
 // ==== 基础配置 ====
 const PORT = process.env.PORT || 3000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;  // 在 Render 环境变量里填
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "dev-admin"; // 简单保护导出接口
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "dev-admin";
 const MODEL = process.env.MODEL || "gpt-4o";
-const MEMORY_WINDOW = parseInt(process.env.MEMORY_WINDOW || "12", 10); // 最近8–12轮
+const MEMORY_WINDOW = parseInt(process.env.MEMORY_WINDOW || "12", 10); // 最近N轮
 const GLOBAL_CONCURRENCY = parseInt(process.env.GLOBAL_CONCURRENCY ?? 10, 10); // 全局并发上限
-const MAX_QUEUE = parseInt(process.env.MAX_QUEUE || "100", 10); // 允许排队的最大请求数
+const MAX_QUEUE = parseInt(process.env.MAX_QUEUE || "100", 10); // 允许排队的最大请求数（当前示例未用）
 
 if (!OPENAI_API_KEY) {
   console.error("Missing OPENAI_API_KEY");
@@ -22,7 +22,22 @@ if (!OPENAI_API_KEY) {
 
 const client = new OpenAI({ apiKey: OPENAI_API_KEY });
 const app = express();
-const sem = { acquire: async () => {}, release: () => {} };
+
+// ---- 并发限流（先定义，后使用）----
+class Semaphore {
+  constructor(max){ this.max = max; this.cur = 0; this.q = []; }
+  async acquire(){
+    if (this.cur < this.max) { this.cur++; return; }
+    await new Promise(r => this.q.push(r));
+    this.cur++;
+  }
+  release(){
+    this.cur--;
+    if (this.q.length) this.q.shift()();
+  }
+}
+const sem = new Semaphore(GLOBAL_CONCURRENCY);
+
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
@@ -43,14 +58,12 @@ if (fs.existsSync(path.join(clientDir, "index.html"))) {
   );
 }
 
-
 // ==== 简易内存存储（实验够用；重启会丢）====
 const memories = new Map(); // sessionId -> [{role, content, ts}]
-const logs = [];            // 结构化日志，便于导出
+const logs = [];            // 结构化日志
 
 function getSessionHistory(sessionId) {
   const arr = memories.get(sessionId) || [];
-  // 只取最近 N 轮
   return arr.slice(-MEMORY_WINDOW);
 }
 function appendSessionMessage(sessionId, msg) {
@@ -62,8 +75,7 @@ function logEvent(e) {
   logs.push({ ts: new Date().toISOString(), ...e });
 }
 
-
-// ==== 每会话串行锁（避免同一会话并发写历史）====
+// ==== 每会话串行锁（避免同会话并发写历史）====
 const sessionLocks = new Map(); // sessionId -> lastPromise
 async function runInSessionLock(sessionId, fn) {
   const last = sessionLocks.get(sessionId) || Promise.resolve();
@@ -74,9 +86,29 @@ async function runInSessionLock(sessionId, fn) {
   return next;
 }
 
-// ==== 健康检查，避免 Render 判定超时 ====
+// ==== 健康检查 ====
 app.get("/healthz", (_req, res) => res.status(200).send("OK"));
 function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
+
+// ==== 压测用的静态接口（不触发 OpenAI）====
+app.get("/test", (req, res) => {
+  res.json({
+    status: "ok",
+    message: "This is a mock response. OpenAI API not triggered.",
+    now: new Date().toISOString()
+  });
+});
+
+// 可选：模拟慢请求（/test/echo?delay=1000 表示延迟1秒再返回）
+app.get("/test/echo", async (req, res) => {
+  const delay = Math.max(0, parseInt(req.query.delay || "0", 10));
+  if (delay) await sleep(delay);
+  res.json({
+    status: "ok",
+    delay_ms: delay,
+    now: new Date().toISOString()
+  });
+});
 
 async function callOpenAIWithRetry(payload, retries = 3) {
   let delay = 400; // 初始退避
@@ -85,7 +117,6 @@ async function callOpenAIWithRetry(payload, retries = 3) {
       return await client.chat.completions.create(payload);
     } catch (e) {
       const status = e?.status || e?.response?.status;
-      // 限速/服务端错误 → 退避重试；其它错误直接抛出
       if ((status === 429 || (status >= 500 && status < 600)) && i < retries) {
         await sleep(delay + Math.floor(Math.random() * 200));
         delay *= 2;
@@ -108,23 +139,6 @@ function errInfo(e) {
   };
 }
 
-// ---- 并发限流（放在 /chat 之前）----
-class Semaphore {
-  constructor(max){ this.max = max; this.cur = 0; this.q = []; }
-  async acquire(){
-    if (this.cur < this.max) { this.cur++; return; }
-    await new Promise(r => this.q.push(r));
-    this.cur++;
-  }
-  release(){
-    this.cur--;
-    if (this.q.length) this.q.shift()();
-  }
-}
-
-
-
-
 // ==== 核心聊天接口 ====
 app.post("/chat", async (req, res) => {
   const { sessionId, userMessage } = req.body || {};
@@ -134,7 +148,6 @@ app.post("/chat", async (req, res) => {
 
   try {
     await runInSessionLock(sessionId, async () => {
-      // 记录用户消息
       appendSessionMessage(sessionId, { role: "user", content: String(userMessage) });
     });
 
@@ -144,30 +157,28 @@ app.post("/chat", async (req, res) => {
     try {
       const history = getSessionHistory(sessionId);
 
-      // 组装提示：系统规则 + 最近N轮 + 当前消息（已在历史中）
       const systemRule = {
-  role: "system",
-  content: `你是一名小学Scratch 编程课堂的小助手，名字叫做小智。你的身份和任务是：协助教师，解答学生在课堂上的编程问题。
+        role: "system",
+        content: `你是一名小学Scratch 编程课堂的小助手，名字叫做小智。你的身份和任务是：协助教师，解答学生在课堂上的编程问题。
 
 回答要求：
 1. 交流方式：语气温和、活泼，像一位亲切的小老师，始终给予积极鼓励。回答要简短清晰，避免复杂结构或长句，使用小学三年级学生能够理解的简单词汇，不使用复杂专业术语或成人化的学术长篇解释，禁止回答不适宜未成年的内容。
 2. 课堂内容：所有回答必须紧扣 Scratch 编程课堂，不偏离主题，不提供与课堂无关的信息。解释编程概念时，尽量结合生活中的例子或简单比喻帮助学生理解，并突出关键信息，避免冗长。
 3. 操作指导：在涉及具体操作步骤时，要简洁清晰地说明关键步骤，确保学生能够快速上手。
 4. 学习目标：通过耐心解答与积极反馈，帮助小学生顺利学习 Scratch，培养他们的编程兴趣和信心，同时确保所有回答内容适合未成年人。`
-};
+      };
 
       const messages = [systemRule, ...history];
 
-      // 调用 OpenAI（控制长度与风格）
-   const resp = await callOpenAIWithRetry({
-  model: MODEL,
-  messages,
-  temperature: 0.3,
-  top_p: 0.9,
-  max_tokens: 600,
-  presence_penalty: 0,
-  frequency_penalty: 0.2,
-});
+      const resp = await callOpenAIWithRetry({
+        model: MODEL,
+        messages,
+        temperature: 0.3,
+        top_p: 0.9,
+        max_tokens: 600,
+        presence_penalty: 0,
+        frequency_penalty: 0.2,
+      });
 
       const choice = resp.choices?.[0];
       answerText = choice?.message?.content?.trim() || "";
@@ -176,7 +187,6 @@ app.post("/chat", async (req, res) => {
       sem.release();
     }
 
-    // 记录与落盘内存
     await runInSessionLock(sessionId, async () => {
       appendSessionMessage(sessionId, { role: "assistant", content: answerText });
       logEvent({
@@ -189,16 +199,15 @@ app.post("/chat", async (req, res) => {
     });
 
     res.json({ answer: answerText });
- } catch (err) {
-  const info = errInfo(err);
-  console.error("Chat error:", info, err?.stack);
-  logEvent({ type: "error", sessionId, ...info });
+  } catch (err) {
+    const info = errInfo(err);
+    console.error("Chat error:", info, err?.stack);
+    logEvent({ type: "error", sessionId, ...info });
 
-  const payload = { error: "Server error" };
-  if (process.env.DEBUG_ERRORS === "1") payload.debug = info; // 只有打开 DEBUG_ERRORS 才返回详细信息
-  res.status(500).json(payload);
-}
-
+    const payload = { error: "Server error" };
+    if (process.env.DEBUG_ERRORS === "1") payload.debug = info;
+    res.status(500).json(payload);
+  }
 });
 
 // ==== 管理：导出日志（JSONL）====
@@ -207,7 +216,6 @@ app.get("/admin/export-logs", (req, res) => {
     return res.status(401).send("Unauthorized");
   }
   res.setHeader("Content-Type", "application/json; charset=utf-8");
-  // 导出为 JSONL（每行一个事件）
   const body = logs.map(obj => JSON.stringify(obj)).join("\n");
   res.send(body);
 });
