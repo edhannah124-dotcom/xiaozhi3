@@ -1,3 +1,7 @@
+import path from "path";
+import { fileURLToPath } from "url";
+import fs from "fs";
+
 import express from "express";
 import cors from "cors";
 import OpenAI from "openai";
@@ -19,6 +23,24 @@ const client = new OpenAI({ apiKey: OPENAI_API_KEY });
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
+
+// 计算 __dirname（ESM）
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// 指向你的前端目录（如果你用打包产物，就把 client 改成 client/dist）
+const clientDir = path.resolve(__dirname, "../client");
+
+// 如果有 client/index.html，就把它当首页；否则给个友好提示
+if (fs.existsSync(path.join(clientDir, "index.html"))) {
+  app.use(express.static(clientDir));
+  app.get("/", (_req, res) => res.sendFile(path.join(clientDir, "index.html")));
+} else {
+  app.get("/", (_req, res) =>
+    res.status(200).send("Backend OK. Use /healthz or POST /chat")
+  );
+}
+
 
 // ==== 简易内存存储（实验够用；重启会丢）====
 const memories = new Map(); // sessionId -> [{role, content, ts}]
