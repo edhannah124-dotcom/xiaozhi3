@@ -114,6 +114,18 @@ async function callOpenAIWithRetry(payload, retries = 3) {
   }
 }
 
+function errInfo(e) {
+  const status = e?.status || e?.response?.status;
+  const data = e?.response?.data;
+  return {
+    status,
+    message: e?.message,
+    code: data?.error?.code || e?.code,
+    type: data?.error?.type,
+    details: data?.error?.message || undefined,
+  };
+}
+
 
 // ==== 核心聊天接口 ====
 app.post("/chat", async (req, res) => {
@@ -173,11 +185,16 @@ app.post("/chat", async (req, res) => {
     });
 
     res.json({ answer: answerText });
-  } catch (err) {
-    console.error(err);
-    logEvent({ type: "error", sessionId, error: String(err?.message || err) });
-    res.status(500).json({ error: "Server error" });
-  }
+ } catch (err) {
+  const info = errInfo(err);
+  console.error("Chat error:", info, err?.stack);
+  logEvent({ type: "error", sessionId, ...info });
+
+  const payload = { error: "Server error" };
+  if (process.env.DEBUG_ERRORS === "1") payload.debug = info; // 只有打开 DEBUG_ERRORS 才返回详细信息
+  res.status(500).json(payload);
+}
+
 });
 
 // ==== 管理：导出日志（JSONL）====
