@@ -22,6 +22,7 @@ if (!OPENAI_API_KEY) {
 
 const client = new OpenAI({ apiKey: OPENAI_API_KEY });
 const app = express();
+const sem = { acquire: async () => {}, release: () => {} };
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
