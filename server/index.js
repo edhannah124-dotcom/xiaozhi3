@@ -126,6 +126,21 @@ function errInfo(e) {
   };
 }
 
+// ---- 并发限流（放在 /chat 之前）----
+class Semaphore {
+  constructor(max){ this.max = max; this.cur = 0; this.q = []; }
+  async acquire(){
+    if (this.cur < this.max) { this.cur++; return; }
+    await new Promise(r => this.q.push(r));
+    this.cur++;
+  }
+  release(){
+    this.cur--;
+    if (this.q.length) this.q.shift()();
+  }
+}
+const sem = new Semaphore(GLOBAL_CONCURRENCY);
+
 
 // ==== 核心聊天接口 ====
 app.post("/chat", async (req, res) => {
