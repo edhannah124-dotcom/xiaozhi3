@@ -61,25 +61,6 @@ function logEvent(e) {
   logs.push({ ts: new Date().toISOString(), ...e });
 }
 
-// ==== 全局并发信号量 ====
-class Semaphore {
-  constructor(max) { this.max = max; this.cur = 0; this.q = []; }
-  async acquire() {
-    if (this.cur < this.max) { this.cur++; return; }
-    if (this.q.length >= MAX_QUEUE) {
-      const err = new Error("queue_full");
-      err.code = "QUEUE_FULL";
-      throw err;
-    }
-    await new Promise(res => this.q.push(res));
-    this.cur++;
-  }
-  release() {
-    this.cur--;
-    if (this.q.length) this.q.shift()();
-  }
-}
-
 
 // ==== 每会话串行锁（避免同一会话并发写历史）====
 const sessionLocks = new Map(); // sessionId -> lastPromise
@@ -140,6 +121,7 @@ class Semaphore {
   }
 }
 const sem = new Semaphore(GLOBAL_CONCURRENCY);
+
 
 
 // ==== 核心聊天接口 ====
