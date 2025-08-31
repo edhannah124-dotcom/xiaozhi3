@@ -158,7 +158,7 @@ app.post("/chat", async (req, res) => {
   messages,
   temperature: 0.3,
   top_p: 0.9,
-  max_tokens: 200,
+  max_tokens: 600,
   presence_penalty: 0,
   frequency_penalty: 0.2,
 });
