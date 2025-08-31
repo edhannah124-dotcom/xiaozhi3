@@ -12,7 +12,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;  // 在 Render 环境变量�
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "dev-admin"; // 简单保护导出接口
 const MODEL = process.env.MODEL || "gpt-4o";
 const MEMORY_WINDOW = parseInt(process.env.MEMORY_WINDOW || "12", 10); // 最近8–12轮
-const GLOBAL_CONCURRENCY = parseInt(process.env.GLOBAL_CONCURRENCY || “10", 10); // 全局并发上限
+const GLOBAL_CONCURRENCY = parseInt(process.env.GLOBAL_CONCURRENCY ?? 10, 10); // 全局并发上限
 const MAX_QUEUE = parseInt(process.env.MAX_QUEUE || "100", 10); // 允许排队的最大请求数
 
 if (!OPENAI_API_KEY) {
