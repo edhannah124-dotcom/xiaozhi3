@@ -22,7 +22,52 @@ if (!OPENAI_API_KEY) {
 
 const client = new OpenAI({ apiKey: OPENAI_API_KEY });
 const app = express();
-const sem = { acquire: async () => {}, release: () => {} };
+// ---- 并发限流（放在 /chat 之前）----
+class Semaphore {
+  constructor(max, maxQueue) {
+    this.max = Math.max(1, max);
+    this.cur = 0;
+    this.q = [];
+    this.maxQueue = Math.max(0, maxQueue);
+  }
+
+  snapshot() {
+    return {
+      inFlight: this.cur,
+      queued: this.q.length,
+      max: this.max,
+      maxQueue: this.maxQueue,
+    };
+  }
+
+  async acquire() {
+    // 如果还有余量，直接进入
+    if (this.cur < this.max) {
+      this.cur++;
+      return;
+    }
+
+    // 队列已满，直接拒绝
+    if (this.q.length >= this.maxQueue) {
+      const err = new Error("Server busy: queue is full");
+      err.code = "QUEUE_FULL";
+      throw err;
+    }
+
+    // 加入等待队列
+    await new Promise((resolve) => this.q.push(resolve));
+    this.cur++;
+  }
+
+  release() {
+    if (this.cur > 0) this.cur--;
+    // 叫醒队列中的下一个
+    const next = this.q.shift();
+    if (next) next();
+  }
+}
+
+const sem = new Semaphore(GLOBAL_CONCURRENCY, MAX_QUEUE);
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
@@ -108,22 +153,6 @@ function errInfo(e) {
   };
 }
 
-// ---- 并发限流（放在 /chat 之前）----
-class Semaphore {
-  constructor(max){ this.max = max; this.cur = 0; this.q = []; }
-  async acquire(){
-    if (this.cur < this.max) { this.cur++; return; }
-    await new Promise(r => this.q.push(r));
-    this.cur++;
-  }
-  release(){
-    this.cur--;
-    if (this.q.length) this.q.shift()();
-  }
-}
-
-
-
 
 // ==== 核心聊天接口 ====
 app.post("/chat", async (req, res) => {
@@ -132,49 +161,48 @@ app.post("/chat", async (req, res) => {
     return res.status(400).json({ error: "sessionId and userMessage are required" });
   }
 
+  let acquired = false;
   try {
+    await sem.acquire();
+    acquired = true;
+
     await runInSessionLock(sessionId, async () => {
       // 记录用户消息
       appendSessionMessage(sessionId, { role: "user", content: String(userMessage) });
     });
 
-    await sem.acquire();
     let answerText = "";
     let usage = null;
-    try {
-      const history = getSessionHistory(sessionId);
+    const history = getSessionHistory(sessionId);
 
-      // 组装提示：系统规则 + 最近N轮 + 当前消息（已在历史中）
-      const systemRule = {
-  role: "system",
-  content: `你是一名小学Scratch 编程课堂的小助手，名字叫做小智。你的身份和任务是：协助教师，解答学生在课堂上的编程问题。
+    // 组装提示：系统规则 + 最近N轮 + 当前消息（已在历史中）
+    const systemRule = {
+      role: "system",
+      content: `你是一名小学Scratch 编程课堂的小助手，名字叫做小智。你的身份和任务是：协助教师，解答学生在课堂上的编程问题。
 
 回答要求：
 1. 交流方式：语气温和、活泼，像一位亲切的小老师，始终给予积极鼓励。回答要简短清晰，避免复杂结构或长句，使用小学三年级学生能够理解的简单词汇，不使用复杂专业术语或成人化的学术长篇解释，禁止回答不适宜未成年的内容。
 2. 课堂内容：所有回答必须紧扣 Scratch 编程课堂，不偏离主题，不提供与课堂无关的信息。解释编程概念时，尽量结合生活中的例子或简单比喻帮助学生理解，并突出关键信息，避免冗长。
 3. 操作指导：在涉及具体操作步骤时，要简洁清晰地说明关键步骤，确保学生能够快速上手。
 4. 学习目标：通过耐心解答与积极反馈，帮助小学生顺利学习 Scratch，培养他们的编程兴趣和信心，同时确保所有回答内容适合未成年人。`
-};
+    };
 
-      const messages = [systemRule, ...history];
+    const messages = [systemRule, ...history];
 
-      // 调用 OpenAI（控制长度与风格）
-   const resp = await callOpenAIWithRetry({
-  model: MODEL,
-  messages,
-  temperature: 0.3,
-  top_p: 0.9,
-  max_tokens: 600,
-  presence_penalty: 0,
-  frequency_penalty: 0.2,
-});
+    // 调用 OpenAI（控制长度与风格）
+    const resp = await callOpenAIWithRetry({
+      model: MODEL,
+      messages,
+      temperature: 0.3,
+      top_p: 0.9,
+      max_tokens: 600,
+      presence_penalty: 0,
+      frequency_penalty: 0.2,
+    });
 
-      const choice = resp.choices?.[0];
-      answerText = choice?.message?.content?.trim() || "";
-      usage = resp.usage;
-    } finally {
-      sem.release();
-    }
+    const choice = resp.choices?.[0];
+    answerText = choice?.message?.content?.trim() || "";
+    usage = resp.usage;
 
     // 记录与落盘内存
     await runInSessionLock(sessionId, async () => {
@@ -189,18 +217,26 @@ app.post("/chat", async (req, res) => {
     });
 
     res.json({ answer: answerText });
- } catch (err) {
-  const info = errInfo(err);
-  console.error("Chat error:", info, err?.stack);
-  logEvent({ type: "error", sessionId, ...info });
+  } catch (err) {
+    if (err?.code === "QUEUE_FULL") {
+      const payload = { error: "Server busy, please retry later" };
+      const snapshot = sem.snapshot();
+      logEvent({ type: "queue_full", sessionId, ...snapshot });
+      return res.status(503).json(payload);
+    }
 
-  const payload = { error: "Server error" };
-  if (process.env.DEBUG_ERRORS === "1") payload.debug = info; // 只有打开 DEBUG_ERRORS 才返回详细信息
-  res.status(500).json(payload);
-}
+    const info = errInfo(err);
+    console.error("Chat error:", info, err?.stack);
+    logEvent({ type: "error", sessionId, ...info });
+
+    const payload = { error: "Server error" };
+    if (process.env.DEBUG_ERRORS === "1") payload.debug = info; // 只有打开 DEBUG_ERRORS 才返回详细信息
+    res.status(500).json(payload);
+  } finally {
+    if (acquired) sem.release();
+  }
 
 });
-
 // ==== 管理：导出日志（JSONL）====
 app.get("/admin/export-logs", (req, res) => {
   if (req.headers["x-admin-token"] !== ADMIN_TOKEN) {
@@ -222,4 +258,3 @@ app.get("/admin/sessions", (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`Server running on ${PORT}`));
-
