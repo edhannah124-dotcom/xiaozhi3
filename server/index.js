@@ -22,7 +22,43 @@ if (!OPENAI_API_KEY) {
 
 const client = new OpenAI({ apiKey: OPENAI_API_KEY });
 const app = express();
-const sem = { acquire: async () => {}, release: () => {} };
+// ---- 并发限流（放在 /chat 之前）----
+class Semaphore {
+  constructor(max, maxQueue) {
+    this.max = Math.max(1, max);
+    this.cur = 0;
+    this.q = [];
+    this.maxQueue = Math.max(0, maxQueue);
+  }
+
+  async acquire() {
+    // 如果还有余量，直接进入
+    if (this.cur < this.max) {
+      this.cur++;
+      return;
+    }
+
+    // 队列已满，直接拒绝
+    if (this.q.length >= this.maxQueue) {
+      const err = new Error("Server busy: queue is full");
+      err.code = "QUEUE_FULL";
+      throw err;
+    }
+
+    // 加入等待队列
+    await new Promise((resolve) => this.q.push(resolve));
+    this.cur++;
+  }
+
+  release() {
+    if (this.cur > 0) this.cur--;
+    // 叫醒队列中的下一个
+    const next = this.q.shift();
+    if (next) next();
+  }
+}
+
+const sem = new Semaphore(GLOBAL_CONCURRENCY, MAX_QUEUE);
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
@@ -108,22 +144,6 @@ function errInfo(e) {
   };
 }
 
-// ---- 并发限流（放在 /chat 之前）----
-class Semaphore {
-  constructor(max){ this.max = max; this.cur = 0; this.q = []; }
-  async acquire(){
-    if (this.cur < this.max) { this.cur++; return; }
-    await new Promise(r => this.q.push(r));
-    this.cur++;
-  }
-  release(){
-    this.cur--;
-    if (this.q.length) this.q.shift()();
-  }
-}
-
-
-
 
 // ==== 核心聊天接口 ====
 app.post("/chat", async (req, res) => {
@@ -132,6 +152,7 @@ app.post("/chat", async (req, res) => {
     return res.status(400).json({ error: "sessionId and userMessage are required" });
   }
 
+  let acquired = false;
   try {
     await runInSessionLock(sessionId, async () => {
       // 记录用户消息
@@ -139,6 +160,7 @@ app.post("/chat", async (req, res) => {
     });
 
     await sem.acquire();
+    acquired = true;
     let answerText = "";
     let usage = null;
     try {
@@ -173,7 +195,7 @@ app.post("/chat", async (req, res) => {
       answerText = choice?.message?.content?.trim() || "";
       usage = resp.usage;
     } finally {
-      sem.release();
+      if (acquired) sem.release();
     }
 
     // 记录与落盘内存
@@ -190,6 +212,12 @@ app.post("/chat", async (req, res) => {
 
     res.json({ answer: answerText });
  } catch (err) {
+  if (err?.code === "QUEUE_FULL") {
+    const payload = { error: "Server busy, please retry later" };
+    logEvent({ type: "queue_full", sessionId, queued: MAX_QUEUE });
+    return res.status(503).json(payload);
+  }
+
   const info = errInfo(err);
   console.error("Chat error:", info, err?.stack);
   logEvent({ type: "error", sessionId, ...info });
